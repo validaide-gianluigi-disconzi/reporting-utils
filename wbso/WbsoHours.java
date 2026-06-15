@@ -13,15 +13,13 @@ import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.OutputStream;
 
 /**
  * WBSO hours substantiation for Jira project VALCM — dependency-free (JDK only).
  *
  * Pulls every issue labelled "wbso", reconstructs each issue's status + assignee
  * history from the full changelog, converts story points to an estimate of hours
- * worked per person per month (from a start month), and writes one .xlsx with
+ * worked per person for a single calendar month, and writes one .xlsx with
  * tabs: Summary, Detail, Issues, StatusAudit, Notes.
  *
  * Methodology (see Notes tab in the output):
@@ -29,13 +27,14 @@ import java.io.OutputStream;
  *   - Base = Story Points DEV (customfield_12867) + QA (customfield_12904), each x4.
  *     The total field (customfield_10025) is used only when both DEV and QA are empty.
  *   - DEV hours spread over whoever held the ticket during DEV-phase statuses, QA hours
- *     over QA-phase statuses; time-weighted; months from transition timestamps; clipped
- *     to the start month. This is a derived estimate, not logged time.
+ *     over QA-phase statuses; time-weighted. Each month receives the share of the
+ *     budget equal to phase-time inside that month / phase-time over the issue's whole
+ *     life, so monthly runs are consistent and sum to the issue total. Derived estimate.
  *
  * Build:  javac WbsoHours.java
  * Run:    export JIRA_EMAIL="you@company.com"
  *         export JIRA_API_TOKEN="xxxxx"
- *         java WbsoHours --start 2026-01 --out wbso_hours.xlsx
+ *         java WbsoHours --month 2026-01 --out wbso_2026-01.xlsx
  *         (optional: --project VALCM  --label wbso  --base https://skycell.atlassian.net)
  *         java WbsoHours --selftest        # runs on synthetic data, no network
  *
@@ -80,10 +79,15 @@ public class WbsoHours {
         }
         String project = opt.getOrDefault("project", "VALCM");
         String label   = opt.getOrDefault("label", "wbso");
-        String startM  = opt.getOrDefault("start", "2026-01");
+        String monthArg = opt.getOrDefault("month", YearMonth.now().toString());
+        if (opt.containsKey("start"))
+            System.err.println("Note: --start is no longer used; this version reports a single month via --month YYYY-MM.");
         String out     = opt.getOrDefault("out", "wbso_hours.xlsx");
         String base    = opt.getOrDefault("base", env("JIRA_BASE_URL", "https://skycell.atlassian.net"));
-        LocalDateTime clip = parseStartMonth(startM);
+        LocalDateTime winStart = parseMonth(monthArg);
+        LocalDateTime winEnd   = YearMonth.from(winStart).plusMonths(1).atDay(1).atStartOfDay();
+        String targetMonth = YearMonth.from(winStart).toString();
+        System.out.println("Reporting month: " + targetMonth);
 
         List<Issue> issues; Map<String, List<Change>> logs;
         if (selftest) {
@@ -115,21 +119,24 @@ public class WbsoHours {
         List<Detail> detail = new ArrayList<>();
         List<Meta> metas = new ArrayList<>();
         TreeMap<String, String> statusAudit = new TreeMap<>();
-        for (Issue is : issues) allocate(is, logs.getOrDefault(is.key, Collections.emptyList()), clip, detail, metas, statusAudit);
+        for (Issue is : issues) allocate(is, logs.getOrDefault(is.key, Collections.emptyList()), winStart, winEnd, targetMonth, detail, metas, statusAudit);
 
         double total = detail.stream().mapToDouble(d -> d.hours).sum();
         Set<String> people = new TreeSet<>();
         for (Detail d : detail) people.add(d.person);
-        System.out.printf("Grand total: %.1f h across %d people%n", total, people.size());
+        System.out.printf("Grand total: %.1f h across %d people for %s%n", total, people.size(), targetMonth);
 
-        writeWorkbook(out, detail, metas, statusAudit, project, label, startM);
+        writeWorkbook(out, detail, metas, statusAudit, project, label, targetMonth);
         System.out.println("Wrote " + out);
     }
 
     static String env(String k, String def) { String v = System.getenv(k); return v == null ? def : v; }
 
     // ============================ allocation ============================
-    static void allocate(Issue is, List<Change> changes, LocalDateTime clip,
+    // Hours for an issue's point-budget attributable to the target month = budget x
+    // (phase-time inside the window) / (phase-time over the issue's whole life).
+    // Run per month, the months sum to the issue total — no double counting.
+    static void allocate(Issue is, List<Change> changes, LocalDateTime winStart, LocalDateTime winEnd, String targetMonth,
                          List<Detail> detail, List<Meta> metas, Map<String, String> audit) {
         Meta m = new Meta();
         m.issue = is.key; m.issueType = is.issueType; m.status = is.currentStatus;
@@ -151,7 +158,6 @@ public class WbsoHours {
         LocalDateTime endTime = is.resolved != null ? parseTs(is.resolved)
                               : is.updated != null ? parseTs(is.updated) : LocalDateTime.now();
 
-        // split changes by field, sorted
         List<Change> statusCh = new ArrayList<>(), assignCh = new ArrayList<>(), all = new ArrayList<>();
         for (Change c : changes) {
             if (c.field.equals("status")) statusCh.add(c);
@@ -166,12 +172,7 @@ public class WbsoHours {
         String curA = assignCh.isEmpty() ? is.currentAssignee : assignCh.get(0).fromStr;
         LocalDateTime lastTs = created;
 
-        // weights per (person|month|phase) for this issue
-        Map<String, Double> wDev = new LinkedHashMap<>(), wQa = new LinkedHashMap<>();
-        double sumDev = 0, sumQa = 0;
-
-        List<LocalDateTime[]> dummy = new ArrayList<>(); // not used; intervals processed inline
-        List<Object[]> intervals = new ArrayList<>();     // {start, end, status, assignee}
+        List<Object[]> intervals = new ArrayList<>(); // {start, end, status, assignee}
         for (Change c : all) {
             if (c.ts.isAfter(lastTs)) intervals.add(new Object[]{lastTs, c.ts, curS, curA});
             if (c.field.equals("status")) curS = c.toStr; else curA = c.toStr;
@@ -179,80 +180,81 @@ public class WbsoHours {
         }
         if (endTime.isAfter(lastTs)) intervals.add(new Object[]{lastTs, endTime, curS, curA});
 
-        boolean hadWorkPhase = false;  // any DEV/QA interval at all, even before the clip date
+        // whole-life phase totals (denominators) + per-person time inside the window (numerators)
+        double lifeDev = 0, lifeQa = 0;
+        Map<String, Double> winDev = new LinkedHashMap<>(), winQa = new LinkedHashMap<>();
         for (Object[] iv : intervals) {
             String st = (String) iv[2];
-            if (st != null) { String s = norm(st); audit.put(s, classify(st)); }
+            if (st != null) audit.put(norm(st), classify(st));
             String phase = classify(st);
             if (phase == null) continue;
-            hadWorkPhase = true;
-            LocalDateTime segStart = (LocalDateTime) iv[0], segEnd = (LocalDateTime) iv[1];
-            if (segStart.isBefore(clip)) segStart = clip;
-            if (!segEnd.isAfter(segStart)) continue;
-            String person = iv[3] == null ? "(unassigned)" : (String) iv[3];
-            for (Object[] ms : monthSlices(segStart, segEnd)) {
-                String month = (String) ms[0]; double secs = (Double) ms[1];
-                if (secs <= 0) continue;
-                String k = person + "\u0001" + month;
-                if (phase.equals("DEV")) { wDev.merge(k, secs, Double::sum); sumDev += secs; }
-                else { wQa.merge(k, secs, Double::sum); sumQa += secs; }
+            LocalDateTime s0 = (LocalDateTime) iv[0], s1 = (LocalDateTime) iv[1];
+            double full = secs(s0, s1);
+            if (phase.equals("DEV")) lifeDev += full; else lifeQa += full;
+            LocalDateTime lo = s0.isAfter(winStart) ? s0 : winStart;
+            LocalDateTime hi = s1.isBefore(winEnd) ? s1 : winEnd;
+            if (hi.isAfter(lo)) {
+                double w = secs(lo, hi);
+                String person = iv[3] == null ? "(unassigned)" : (String) iv[3];
+                if (phase.equals("DEV")) winDev.merge(person, w, Double::sum); else winQa.merge(person, w, Double::sum);
             }
         }
 
         if (baseMode.equals("DEV+QA")) {
-            distribute(is.key, wDev, sumDev, devBudget, "DEV", "time-weighted", detail, m);
-            distribute(is.key, wQa, sumQa, qaBudget, "QA", "time-weighted", detail, m);
+            allocPhase(is.key, winDev, lifeDev, devBudget, "DEV", targetMonth, detail, m);
+            allocPhase(is.key, winQa, lifeQa, qaBudget, "QA", targetMonth, detail, m);
             m.method = "time-weighted (DEV+QA)";
-        } else { // TOTAL fallback: pool DEV+QA weights, one budget
+            fallbackPhase(is, devBudget, lifeDev, "DEV", winStart, winEnd, targetMonth, detail, m);
+            fallbackPhase(is, qaBudget, lifeQa, "QA", winStart, winEnd, targetMonth, detail, m);
+        } else { // TOTAL fallback: pool DEV+QA, one budget
             Map<String, Double> pooled = new LinkedHashMap<>();
-            wDev.forEach((k, v) -> pooled.merge(k, v, Double::sum));
-            wQa.forEach((k, v) -> pooled.merge(k, v, Double::sum));
-            double sumAll = sumDev + sumQa;
-            distribute(is.key, pooled, sumAll, devBudget, "DEV", "time-weighted (total pool)", detail, m);
+            winDev.forEach((k, v) -> pooled.merge(k, v, Double::sum));
+            winQa.forEach((k, v) -> pooled.merge(k, v, Double::sum));
+            double lifeAll = lifeDev + lifeQa;
+            allocPhase(is.key, pooled, lifeAll, devBudget, "DEV", targetMonth, detail, m);
             m.method = "time-weighted (total fallback)";
-        }
-
-        // fallback: budget but nothing allocated in range
-        double allocated = m.devAlloc + m.qaAlloc, budgetTotal = devBudget + qaBudget;
-        if (allocated < 0.01 && budgetTotal > 0) {
-            LocalDateTime attrib = is.updated != null ? parseTs(is.updated) : endTime;
-            if (hadWorkPhase) {
-                // there was DEV/QA-phase activity, but all of it before the start month -> counts as 0
-                m.method += " (pre-window)";
-                m.note = "Work-phase time was entirely before the start month; counts as 0.";
-            } else if (attrib != null && attrib.isBefore(clip)) {
-                m.method = "zero (activity before start month)";
-                m.note = "Issue last updated before the start month; counts as 0.";
-            } else {
-                boolean reached = classify(is.currentStatus) != null || is.resolved != null;
-                if (!reached) {
-                    m.method = "zero (no work phase reached)"; m.note = "No DEV/QA-phase status yet; not yet worked.";
-                } else {
-                    String person = is.currentAssignee == null ? "(unassigned)" : is.currentAssignee;
-                    String month = monthKey(attrib != null ? attrib : endTime);
-                    if (devBudget > 0) { detail.add(new Detail(is.key, person, month, "DEV", round(devBudget, 3), 0, "FALLBACK current-assignee")); m.devAlloc += devBudget; }
-                    if (qaBudget > 0) { detail.add(new Detail(is.key, person, month, "QA", round(qaBudget, 3), 0, "FALLBACK current-assignee")); m.qaAlloc += qaBudget; }
-                    m.method += " + FALLBACK";
-                    m.note = "No changelog work-phase intervals; attributed to current assignee in last-update month.";
-                }
-            }
+            fallbackPhase(is, devBudget, lifeAll, "DEV", winStart, winEnd, targetMonth, detail, m);
         }
         m.devAlloc = round(m.devAlloc, 2); m.qaAlloc = round(m.qaAlloc, 2);
         metas.add(m);
     }
 
-    static void distribute(String key, Map<String, Double> weights, double sum, double budget,
-                          String phase, String tag, List<Detail> detail, Meta m) {
-        if (budget <= 0 || sum <= 0) return;
-        for (Map.Entry<String, Double> e : weights.entrySet()) {
-            String[] pk = e.getKey().split("\u0001", 2);
-            double secs = e.getValue();
-            double hrs = budget * secs / sum;
-            if (hrs <= 0) continue;
-            detail.add(new Detail(key, pk[0], pk[1], phase, round(hrs, 3), round(secs / 3600.0, 2), tag));
+    // distribute a phase budget across in-window holders, weighted by in-window time
+    // over the issue's whole-life phase time. No-op when the phase has no timeline.
+    static void allocPhase(String key, Map<String, Double> win, double life, double budget,
+                          String phase, String month, List<Detail> detail, Meta m) {
+        if (budget <= 0 || life <= 0) return;
+        for (Map.Entry<String, Double> e : win.entrySet()) {
+            double w = e.getValue();
+            if (w <= 0) continue;
+            double hrs = budget * w / life;
+            detail.add(new Detail(key, e.getKey(), month, phase, round(hrs, 3), round(w / 3600.0, 2), "time-weighted"));
             if (phase.equals("DEV")) m.devAlloc += hrs; else m.qaAlloc += hrs;
         }
     }
+
+    // fires only when a phase has budget but NO timeline at all. Attributes the whole
+    // phase budget to the current assignee, but only in the month it was last updated/
+    // resolved — so across monthly runs it lands exactly once.
+    static void fallbackPhase(Issue is, double budget, double life, String phase,
+                             LocalDateTime winStart, LocalDateTime winEnd, String month,
+                             List<Detail> detail, Meta m) {
+        if (budget <= 0 || life > 0) return;
+        LocalDateTime attrib = is.resolved != null ? parseTs(is.resolved)
+                             : is.updated != null ? parseTs(is.updated) : null;
+        if (attrib == null) { m.note = note(m.note, phase + ": no timeline and no date; skipped."); return; }
+        boolean inWindow = !attrib.isBefore(winStart) && attrib.isBefore(winEnd);
+        if (!inWindow) { m.note = note(m.note, phase + ": no timeline; belongs to " + monthKey(attrib) + ", not this month."); return; }
+        boolean reached = classify(is.currentStatus) != null || is.resolved != null;
+        if (!reached) { m.note = note(m.note, phase + ": not yet worked."); return; }
+        String person = is.currentAssignee == null ? "(unassigned)" : is.currentAssignee;
+        detail.add(new Detail(is.key, person, month, phase, round(budget, 3), 0, "FALLBACK current-assignee"));
+        if (phase.equals("DEV")) m.devAlloc += budget; else m.qaAlloc += budget;
+        m.method += " + FALLBACK";
+        m.note = note(m.note, phase + ": no changelog timeline; attributed to current assignee this month.");
+    }
+    static String note(String existing, String add) { return existing == null || existing.isEmpty() ? add : existing + " " + add; }
+    static double secs(LocalDateTime a, LocalDateTime b) { return Duration.between(a, b).getSeconds(); }
 
     // ============================ time helpers ============================
     static final DateTimeFormatter TSF = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss");
@@ -260,22 +262,11 @@ public class WbsoHours {
         if (s == null) return null;
         try { return LocalDateTime.parse(s.substring(0, 19), TSF); } catch (Exception e) { return null; }
     }
-    static LocalDateTime parseStartMonth(String s) {
+    static LocalDateTime parseMonth(String s) {
         int y = Integer.parseInt(s.substring(0, 4)), mo = Integer.parseInt(s.substring(5, 7));
         return LocalDateTime.of(y, mo, 1, 0, 0);
     }
     static String monthKey(LocalDateTime dt) { return YearMonth.from(dt).toString(); }
-    static List<Object[]> monthSlices(LocalDateTime a, LocalDateTime b) {
-        List<Object[]> out = new ArrayList<>();
-        LocalDateTime cur = a;
-        while (cur.isBefore(b)) {
-            LocalDateTime nextMonth = YearMonth.from(cur).plusMonths(1).atDay(1).atStartOfDay();
-            LocalDateTime segEnd = nextMonth.isBefore(b) ? nextMonth : b;
-            out.add(new Object[]{YearMonth.from(cur).toString(), (double) Duration.between(cur, segEnd).getSeconds()});
-            cur = segEnd;
-        }
-        return out;
-    }
     static String norm(String st) { return st.replace(" (migrated)", "").trim().toLowerCase(); }
     static String classify(String st) {
         if (st == null) return null;
@@ -444,7 +435,7 @@ public class WbsoHours {
     }
 
     static void writeWorkbook(String out, List<Detail> detail, List<Meta> metas,
-                             TreeMap<String, String> audit, String project, String label, String startM) throws Exception {
+                             TreeMap<String, String> audit, String project, String label, String targetMonth) throws Exception {
         List<Sheet> sheets = new ArrayList<>();
 
         // Summary: person x month
@@ -488,15 +479,15 @@ public class WbsoHours {
         Sheet no = new Sheet("Notes");
         no.header("WBSO hours substantiation — methodology", "");
         no.row("Generated", LocalDateTime.now().toString());
-        no.row("Project", project); no.row("Label", label); no.row("Counted from", startM);
+        no.row("Project", project); no.row("Label", label); no.row("Reporting month", targetMonth);
         no.row("Hours per story point", HOURS_PER_POINT);
         no.row("Base of truth", "Story Points DEV + QA (separate). Total used only when both are empty.");
         no.row("Per-person split", "Role-based, time-weighted: DEV hours to DEV-phase holders, QA to QA-phase holders, proportional to time held.");
-        no.row("Month attribution", "By status-transition timestamps, split across month boundaries, clipped to the start month.");
+        no.row("Month attribution", "Each month gets the share of the issue's point-budget equal to the phase-time inside that month divided by the issue's whole-life phase-time. Months are mutually consistent and sum to the issue total.");
         no.row("DEV-phase statuses", String.join(", ", new TreeSet<>(DEV_STATUSES)));
         no.row("QA-phase statuses", String.join(", ", new TreeSet<>(QA_STATUSES)));
         no.row("Nature of figures", "Derived ESTIMATE: story points x 4, allocated by recorded status history. Not a log of actual hours. Every Summary figure traces through Detail to an issue/person/month/phase.");
-        no.row("Fallback rows", "Issues with no DEV/QA-phase time after the start date are attributed to the current assignee in the last-update month (flagged in Issues); pre-refinement tickets get zero.");
+        no.row("Fallback rows", "Issues with story points but NO DEV/QA-phase changelog timeline are attributed to the current assignee, in the single month they were last updated/resolved (flagged in Issues), so they land once across monthly runs. Pre-refinement tickets get zero.");
         no.row("Unassigned", "Work-phase time while unassigned is bucketed as '(unassigned)' so totals reconcile.");
         no.row("Dutch-employee filter", "NOT applied; all assignees included. Filter downstream.");
         sheets.add(no);
