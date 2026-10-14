@@ -7,6 +7,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.LocalDateTime;
+import java.time.LocalDate;
+import java.time.DayOfWeek;
 import java.time.YearMonth;
 import java.time.Duration;
 import java.time.format.DateTimeFormatter;
@@ -19,8 +21,9 @@ import java.util.zip.ZipOutputStream;
  *
  * Pulls every issue labelled "wbso", reconstructs each issue's status + assignee
  * history from the full changelog, converts story points to an estimate of hours
- * worked per person for a single calendar month, and writes one .xlsx with
- * tabs: Summary, Detail, Issues, StatusAudit, Notes.
+ * worked per person, per RVO project, per working day for a single calendar month,
+ * and writes one .xlsx with tabs: Summary, Daily, DayTotals, Evidence, Detail,
+ * Issues, StatusAudit, Notes.
  *
  * Methodology (see Notes tab in the output):
  *   - 1 story point = 4 hours.
@@ -30,12 +33,19 @@ import java.util.zip.ZipOutputStream;
  *     over QA-phase statuses; time-weighted. Each month receives the share of the
  *     budget equal to phase-time inside that month / phase-time over the issue's whole
  *     life, so monthly runs are consistent and sum to the issue total. Derived estimate.
+ *   - Time held is measured on working days only (Mon-Fri) and split per calendar day,
+ *     so the Daily tab is the per-person / per-project / per-day record RVO asks for.
+ *   - --eligible <file>: one Jira display name per line (Validaide B.V. payroll only).
+ *     Only listed people are counted; everyone else is shown separately so totals reconcile.
+ *   - --rvo-project <id>: the S&O project number from the S&O-verklaring (default 2601).
+ *     An issue label "wbso-<id>" overrides it per issue.
  *
  * Build:  javac WbsoHours.java
  * Run:    export JIRA_EMAIL="you@company.com"
  *         export JIRA_API_TOKEN="xxxxx"
  *         java WbsoHours --month 2026-01 --out wbso_2026-01.xlsx
- *         (optional: --project VALCM  --label wbso  --base https://skycell.atlassian.net)
+ *         (optional: --project VALCM  --label wbso  --base https://skycell.atlassian.net
+ *                    --eligible eligible.txt  --rvo-project 2601)
  *         java WbsoHours --selftest        # runs on synthetic data, no network
  *
  * SECURITY: the token is read from an environment variable and never written to disk.
@@ -52,20 +62,26 @@ public class WbsoHours {
 
     // ============================ data model ============================
     static final class Issue {
-        String key, issueType, currentStatus, currentAssignee, created, resolved, updated;
-        Double devSp, qaSp, totalSp;
+        String key, summary, issueType, currentStatus, currentAssignee, created, resolved, updated;
+        Double devSp, qaSp, totalSp; List<String> labels = new ArrayList<>();
     }
     static final class Change {       // one status/assignee change from the changelog
-        String key, field, fromStr, toStr; LocalDateTime ts;
+        String key, field, fromStr, toStr, author; LocalDateTime ts;
     }
     static final class Detail {
-        String issue, person, month, phase, method; double hours, timeHeld;
-        Detail(String i, String p, String m, String ph, double h, double t, String me) {
-            issue = i; person = p; month = m; phase = ph; hours = h; timeHeld = t; method = me;
+        String issue, person, month, phase, method, rvo; double hours, timeHeld;
+        Detail(String i, String p, String m, String ph, double h, double t, String me, String r) {
+            issue = i; person = p; month = m; phase = ph; hours = h; timeHeld = t; method = me; rvo = r;
+        }
+    }
+    static final class Daily {        // one row of the per-person / per-project / per-day record
+        String issue, person, phase, method, rvo; LocalDate date; double hours;
+        Daily(String i, String p, LocalDate d, String ph, double h, String me, String r) {
+            issue = i; person = p; date = d; phase = ph; hours = h; method = me; rvo = r;
         }
     }
     static final class Meta {
-        String issue, issueType, status, method = "", note = "";
+        String issue, summary, issueType, status, rvo, method = "", note = "";
         double devSp, qaSp, totalSp, devBudget, qaBudget, devAlloc, qaAlloc;
     }
 
@@ -84,10 +100,16 @@ public class WbsoHours {
             System.err.println("Note: --start is no longer used; this version reports a single month via --month YYYY-MM.");
         String out     = opt.getOrDefault("out", "wbso_hours.xlsx");
         String base    = opt.getOrDefault("base", env("JIRA_BASE_URL", "https://skycell.atlassian.net"));
+        String rvoDefault = opt.getOrDefault("rvo-project", "2601");
+        String eligibleFile = opt.get("eligible");
+        Set<String> eligible = eligibleFile == null ? null : loadEligible(eligibleFile);
         LocalDateTime winStart = parseMonth(monthArg);
         LocalDateTime winEnd   = YearMonth.from(winStart).plusMonths(1).atDay(1).atStartOfDay();
         String targetMonth = YearMonth.from(winStart).toString();
         System.out.println("Reporting month: " + targetMonth);
+        System.out.println("RVO project (default): " + rvoDefault + (eligible == null
+                ? "  |  eligibility list: NONE (every named assignee is counted; pass --eligible <file>)"
+                : "  |  eligibility list: " + eligibleFile + " (" + eligible.size() + " names)"));
 
         List<Issue> issues; Map<String, List<Change>> logs;
         if (selftest) {
@@ -117,29 +139,70 @@ public class WbsoHours {
         }
 
         List<Detail> detail = new ArrayList<>();
+        List<Daily> daily = new ArrayList<>();
         List<Meta> metas = new ArrayList<>();
         TreeMap<String, String> statusAudit = new TreeMap<>();
-        for (Issue is : issues) allocate(is, logs.getOrDefault(is.key, Collections.emptyList()), winStart, winEnd, targetMonth, detail, metas, statusAudit);
+        for (Issue is : issues) allocate(is, logs.getOrDefault(is.key, Collections.emptyList()), winStart, winEnd, targetMonth, rvoDefault, detail, daily, metas, statusAudit);
 
         double total = detail.stream().mapToDouble(d -> d.hours).sum();
+        double counted = detail.stream().filter(d -> isEligible(eligible, d.person)).mapToDouble(d -> d.hours).sum();
         Set<String> people = new TreeSet<>();
         for (Detail d : detail) people.add(d.person);
         System.out.printf("Grand total: %.1f h across %d people for %s%n", total, people.size(), targetMonth);
+        System.out.printf("Counted: %.1f h  |  not counted (not on the list, or unassigned): %.1f h%n", counted, total - counted);
 
-        writeWorkbook(out, detail, metas, statusAudit, project, label, targetMonth);
+        writeWorkbook(out, detail, daily, metas, logs, statusAudit, project, label, targetMonth, base, rvoDefault, eligible, eligibleFile, winStart, winEnd);
         System.out.println("Wrote " + out);
     }
 
     static String env(String k, String def) { String v = System.getenv(k); return v == null ? def : v; }
+
+    // ============================ eligibility / project / working days ============================
+    static Set<String> loadEligible(String file) throws Exception {
+        Set<String> s = new TreeSet<>();
+        for (String line : Files.readAllLines(Path.of(file), StandardCharsets.UTF_8)) {
+            String t = line.trim();
+            if (t.isEmpty() || t.startsWith("#")) continue;
+            s.add(t.toLowerCase());
+        }
+        return s;
+    }
+    // null list = no filter configured: every named assignee counts (flagged in Notes). "(unassigned)" never counts.
+    static boolean isEligible(Set<String> eligible, String person) {
+        if (person == null || person.equals("(unassigned)")) return false;
+        return eligible == null || eligible.contains(person.trim().toLowerCase());
+    }
+    static String eligLabel(Set<String> eligible, String person) {
+        if (eligible == null) return person.equals("(unassigned)") ? "no" : "n/a (no list)";
+        return isEligible(eligible, person) ? "yes" : "no";
+    }
+    // RVO project number: an issue label "wbso-<id>" wins, otherwise --rvo-project.
+    static String rvoProject(Issue is, String def) {
+        for (String l : is.labels) if (l.toLowerCase().startsWith("wbso-") && l.length() > 5) return l.substring(5);
+        return def;
+    }
+    // Seconds of [a, b) per calendar day, Saturdays and Sundays excluded.
+    static Map<LocalDate, Double> workingSecs(LocalDateTime a, LocalDateTime b) {
+        Map<LocalDate, Double> m = new LinkedHashMap<>();
+        if (a == null || b == null || !b.isAfter(a)) return m;
+        for (LocalDate d = a.toLocalDate(); !d.isAfter(b.toLocalDate()); d = d.plusDays(1)) {
+            LocalDateTime s0 = d.atStartOfDay(), s1 = d.plusDays(1).atStartOfDay();
+            LocalDateTime lo = a.isAfter(s0) ? a : s0, hi = b.isBefore(s1) ? b : s1;
+            DayOfWeek dow = d.getDayOfWeek();
+            if (hi.isAfter(lo) && dow != DayOfWeek.SATURDAY && dow != DayOfWeek.SUNDAY) m.put(d, secs(lo, hi));
+        }
+        return m;
+    }
+    static String nz(String s) { return s == null ? "" : s; }
 
     // ============================ allocation ============================
     // Hours for an issue's point-budget attributable to the target month = budget x
     // (phase-time inside the window) / (phase-time over the issue's whole life).
     // Run per month, the months sum to the issue total — no double counting.
     static void allocate(Issue is, List<Change> changes, LocalDateTime winStart, LocalDateTime winEnd, String targetMonth,
-                         List<Detail> detail, List<Meta> metas, Map<String, String> audit) {
+                         String rvoDefault, List<Detail> detail, List<Daily> daily, List<Meta> metas, Map<String, String> audit) {
         Meta m = new Meta();
-        m.issue = is.key; m.issueType = is.issueType; m.status = is.currentStatus;
+        m.issue = is.key; m.summary = is.summary; m.issueType = is.issueType; m.status = is.currentStatus; m.rvo = rvoProject(is, rvoDefault);
         m.devSp = nz(is.devSp); m.qaSp = nz(is.qaSp); m.totalSp = nz(is.totalSp);
 
         String baseMode;
@@ -180,40 +243,49 @@ public class WbsoHours {
         }
         if (endTime.isAfter(lastTs)) intervals.add(new Object[]{lastTs, endTime, curS, curA});
 
-        // whole-life phase totals (denominators) + per-person time inside the window (numerators)
+        // whole-life phase totals (denominators) + per-person, per-day time inside the window (numerators).
+        // Time is counted on working days only (Mon-Fri), in the denominator and the numerator alike.
         double lifeDev = 0, lifeQa = 0;
         Map<String, Double> winDev = new LinkedHashMap<>(), winQa = new LinkedHashMap<>();
+        Map<String, Map<LocalDate, Double>> dayDev = new LinkedHashMap<>(), dayQa = new LinkedHashMap<>();
         for (Object[] iv : intervals) {
             String st = (String) iv[2];
             if (st != null) audit.put(norm(st), classify(st));
             String phase = classify(st);
             if (phase == null) continue;
             LocalDateTime s0 = (LocalDateTime) iv[0], s1 = (LocalDateTime) iv[1];
-            double full = secs(s0, s1);
+            double full = 0; for (double v : workingSecs(s0, s1).values()) full += v;
             if (phase.equals("DEV")) lifeDev += full; else lifeQa += full;
             LocalDateTime lo = s0.isAfter(winStart) ? s0 : winStart;
             LocalDateTime hi = s1.isBefore(winEnd) ? s1 : winEnd;
             if (hi.isAfter(lo)) {
-                double w = secs(lo, hi);
                 String person = iv[3] == null ? "(unassigned)" : (String) iv[3];
-                if (phase.equals("DEV")) winDev.merge(person, w, Double::sum); else winQa.merge(person, w, Double::sum);
+                Map<String, Double> win = phase.equals("DEV") ? winDev : winQa;
+                Map<LocalDate, Double> days = (phase.equals("DEV") ? dayDev : dayQa).computeIfAbsent(person, k -> new TreeMap<>());
+                for (Map.Entry<LocalDate, Double> e : workingSecs(lo, hi).entrySet()) {
+                    win.merge(person, e.getValue(), Double::sum);
+                    days.merge(e.getKey(), e.getValue(), Double::sum);
+                }
             }
         }
 
         if (baseMode.equals("DEV+QA")) {
-            allocPhase(is.key, winDev, lifeDev, devBudget, "DEV", targetMonth, detail, m);
-            allocPhase(is.key, winQa, lifeQa, qaBudget, "QA", targetMonth, detail, m);
+            allocPhase(is.key, winDev, dayDev, lifeDev, devBudget, "DEV", targetMonth, detail, daily, m);
+            allocPhase(is.key, winQa, dayQa, lifeQa, qaBudget, "QA", targetMonth, detail, daily, m);
             m.method = "time-weighted (DEV+QA)";
-            fallbackPhase(is, devBudget, lifeDev, "DEV", winStart, winEnd, targetMonth, detail, m);
-            fallbackPhase(is, qaBudget, lifeQa, "QA", winStart, winEnd, targetMonth, detail, m);
+            fallbackPhase(is, devBudget, lifeDev, "DEV", winStart, winEnd, targetMonth, detail, daily, m);
+            fallbackPhase(is, qaBudget, lifeQa, "QA", winStart, winEnd, targetMonth, detail, daily, m);
         } else { // TOTAL fallback: pool DEV+QA, one budget
             Map<String, Double> pooled = new LinkedHashMap<>();
+            Map<String, Map<LocalDate, Double>> pooledDays = new LinkedHashMap<>();
             winDev.forEach((k, v) -> pooled.merge(k, v, Double::sum));
             winQa.forEach((k, v) -> pooled.merge(k, v, Double::sum));
+            for (Map<String, Map<LocalDate, Double>> src : Arrays.asList(dayDev, dayQa))
+                src.forEach((p, ds) -> ds.forEach((d, v) -> pooledDays.computeIfAbsent(p, k -> new TreeMap<>()).merge(d, v, Double::sum)));
             double lifeAll = lifeDev + lifeQa;
-            allocPhase(is.key, pooled, lifeAll, devBudget, "DEV", targetMonth, detail, m);
+            allocPhase(is.key, pooled, pooledDays, lifeAll, devBudget, "DEV", targetMonth, detail, daily, m);
             m.method = "time-weighted (total fallback)";
-            fallbackPhase(is, devBudget, lifeAll, "DEV", winStart, winEnd, targetMonth, detail, m);
+            fallbackPhase(is, devBudget, lifeAll, "DEV", winStart, winEnd, targetMonth, detail, daily, m);
         }
         m.devAlloc = round(m.devAlloc, 2); m.qaAlloc = round(m.qaAlloc, 2);
         metas.add(m);
@@ -221,14 +293,16 @@ public class WbsoHours {
 
     // distribute a phase budget across in-window holders, weighted by in-window time
     // over the issue's whole-life phase time. No-op when the phase has no timeline.
-    static void allocPhase(String key, Map<String, Double> win, double life, double budget,
-                          String phase, String month, List<Detail> detail, Meta m) {
+    static void allocPhase(String key, Map<String, Double> win, Map<String, Map<LocalDate, Double>> days, double life, double budget,
+                          String phase, String month, List<Detail> detail, List<Daily> daily, Meta m) {
         if (budget <= 0 || life <= 0) return;
         for (Map.Entry<String, Double> e : win.entrySet()) {
             double w = e.getValue();
             if (w <= 0) continue;
             double hrs = budget * w / life;
-            detail.add(new Detail(key, e.getKey(), month, phase, round(hrs, 3), round(w / 3600.0, 2), "time-weighted"));
+            detail.add(new Detail(key, e.getKey(), month, phase, round(hrs, 3), round(w / 3600.0, 2), "time-weighted", m.rvo));
+            for (Map.Entry<LocalDate, Double> d : days.getOrDefault(e.getKey(), Collections.emptyMap()).entrySet())
+                daily.add(new Daily(key, e.getKey(), d.getKey(), phase, round(budget * d.getValue() / life, 3), "time-weighted", m.rvo));
             if (phase.equals("DEV")) m.devAlloc += hrs; else m.qaAlloc += hrs;
         }
     }
@@ -238,7 +312,7 @@ public class WbsoHours {
     // resolved — so across monthly runs it lands exactly once.
     static void fallbackPhase(Issue is, double budget, double life, String phase,
                              LocalDateTime winStart, LocalDateTime winEnd, String month,
-                             List<Detail> detail, Meta m) {
+                             List<Detail> detail, List<Daily> daily, Meta m) {
         if (budget <= 0 || life > 0) return;
         LocalDateTime attrib = is.resolved != null ? parseTs(is.resolved)
                              : is.updated != null ? parseTs(is.updated) : null;
@@ -248,7 +322,8 @@ public class WbsoHours {
         boolean reached = classify(is.currentStatus) != null || is.resolved != null;
         if (!reached) { m.note = note(m.note, phase + ": not yet worked."); return; }
         String person = is.currentAssignee == null ? "(unassigned)" : is.currentAssignee;
-        detail.add(new Detail(is.key, person, month, phase, round(budget, 3), 0, "FALLBACK current-assignee"));
+        detail.add(new Detail(is.key, person, month, phase, round(budget, 3), 0, "FALLBACK current-assignee", m.rvo));
+        daily.add(new Daily(is.key, person, attrib.toLocalDate(), phase, round(budget, 3), "FALLBACK current-assignee", m.rvo));
         if (phase.equals("DEV")) m.devAlloc += budget; else m.qaAlloc += budget;
         m.method += " + FALLBACK";
         m.note = note(m.note, phase + ": no changelog timeline; attributed to current assignee this month.");
@@ -280,25 +355,50 @@ public class WbsoHours {
 
     // ============================ Jira REST client ============================
     static final class Jira {
-        final String base, auth; final HttpClient http = HttpClient.newHttpClient();
+        final String base, auth;
+        final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build();
+        static final int MAX_ATTEMPTS = 8;
         Jira(String base, String email, String token) {
             this.base = base.replaceAll("/+$", "");
             this.auth = "Basic " + Base64.getEncoder().encodeToString((email + ":" + token).getBytes(StandardCharsets.UTF_8));
         }
+        // Retries transient failures with exponential backoff (2, 4, 8 ... 60 s): rate limits (429), server
+        // errors (5xx), network hiccups, and the occasional HTTP 400 whose body wraps a backend 500
+        // (Jira Cloud does this for database faults). Genuine client errors fail immediately.
         String getJson(String url) throws Exception {
-            for (int attempt = 0; attempt < 5; attempt++) {
-                HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                        .header("Authorization", auth).header("Accept", "application/json").GET().build();
-                HttpResponse<String> r = http.send(req, HttpResponse.BodyHandlers.ofString());
-                if (r.statusCode() == 429) { Thread.sleep(5000); continue; }
-                if (r.statusCode() >= 500) { Thread.sleep(2000L * (attempt + 1)); continue; }
-                if (r.statusCode() >= 400) throw new RuntimeException("HTTP " + r.statusCode() + ": " + r.body());
-                return r.body();
+            Exception last = null;
+            for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+                long wait = Math.min(60000L, 2000L << (attempt - 1));
+                try {
+                    HttpRequest req = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(90))
+                            .header("Authorization", auth).header("Accept", "application/json").GET().build();
+                    HttpResponse<String> r = http.send(req, HttpResponse.BodyHandlers.ofString());
+                    int sc = r.statusCode();
+                    if (sc >= 200 && sc < 300) return r.body();
+                    boolean transientFault = sc == 429 || sc >= 500 || (sc == 400 && looksLikeServerFault(r.body()));
+                    if (!transientFault) throw new RuntimeException("HTTP " + sc + ": " + r.body());
+                    if (sc == 429) wait = Math.max(wait, retryAfterMillis(r, 5000L));
+                    last = new RuntimeException("HTTP " + sc + ": " + abbreviate(r.body()));
+                    System.err.println("  transient Jira error (HTTP " + sc + "), retry " + attempt + "/" + MAX_ATTEMPTS + " in " + wait / 1000 + "s");
+                } catch (java.io.IOException e) {   // connection reset, timeout, DNS blip
+                    last = e;
+                    System.err.println("  network error (" + e.getClass().getSimpleName() + "), retry " + attempt + "/" + MAX_ATTEMPTS + " in " + wait / 1000 + "s");
+                }
+                Thread.sleep(wait);
             }
-            throw new RuntimeException("Too many retries for " + url);
+            throw new RuntimeException("Gave up after " + MAX_ATTEMPTS + " attempts for " + url + " — last error: " + last, last);
         }
+        static boolean looksLikeServerFault(String body) {
+            if (body == null) return false;
+            return body.contains("\"status-code\":5") || body.contains("Exception") || body.contains("Internal Server Error");
+        }
+        static long retryAfterMillis(HttpResponse<String> r, long def) {
+            try { return r.headers().firstValue("Retry-After").map(v -> Long.parseLong(v.trim()) * 1000L).orElse(def); }
+            catch (Exception e) { return def; }
+        }
+        static String abbreviate(String s) { return s == null ? "" : (s.length() > 300 ? s.substring(0, 300) + "..." : s); }
         List<Issue> searchIssues(String jql) throws Exception {
-            String fields = String.join(",", CF_DEV, CF_QA, CF_TOTAL, "assignee", "status", "created", "resolutiondate", "updated", "issuetype", "labels");
+            String fields = String.join(",", CF_DEV, CF_QA, CF_TOTAL, "assignee", "status", "created", "resolutiondate", "updated", "issuetype", "labels", "summary");
             List<Issue> result = new ArrayList<>();
             String token = null;
             do {
@@ -322,13 +422,15 @@ public class WbsoHours {
                 if (vals == null || vals.isEmpty()) break;
                 for (Object h : vals) {
                     String ts = Json.getStr(h, "created");
+                    Object au = Json.get(h, "author");
+                    String author = au == null ? null : Json.getStr(au, "displayName");
                     List<Object> items = (List<Object>) Json.get(h, "items");
                     if (items == null) continue;
                     for (Object it : items) {
                         String field = Json.getStr(it, "field");
                         if (!"status".equals(field) && !"assignee".equals(field)) continue;
                         Change c = new Change();
-                        c.key = key; c.field = field; c.ts = parseTs(ts);
+                        c.key = key; c.field = field; c.ts = parseTs(ts); c.author = author;
                         c.fromStr = Json.getStr(it, "fromString"); c.toStr = Json.getStr(it, "toString");
                         if (c.ts != null) out.add(c);
                     }
@@ -341,6 +443,9 @@ public class WbsoHours {
             Issue is = new Issue();
             is.key = Json.getStr(o, "key");
             Object f = Json.get(o, "fields");
+            is.summary = Json.getStr(f, "summary");
+            Object lb = Json.get(f, "labels");
+            if (lb instanceof List) for (Object l : (List<Object>) lb) if (l != null) is.labels.add(l.toString());
             is.devSp = Json.getNum(f, CF_DEV); is.qaSp = Json.getNum(f, CF_QA); is.totalSp = Json.getNum(f, CF_TOTAL);
             is.created = Json.getStr(f, "created"); is.resolved = Json.getStr(f, "resolutiondate"); is.updated = Json.getStr(f, "updated");
             Object as = Json.get(f, "assignee"); is.currentAssignee = as == null ? null : Json.getStr(as, "displayName");
@@ -434,39 +539,101 @@ public class WbsoHours {
         }
     }
 
-    static void writeWorkbook(String out, List<Detail> detail, List<Meta> metas,
-                             TreeMap<String, String> audit, String project, String label, String targetMonth) throws Exception {
+    static void writeWorkbook(String out, List<Detail> detail, List<Daily> daily, List<Meta> metas, Map<String, List<Change>> logs,
+                             TreeMap<String, String> audit, String project, String label, String targetMonth, String base,
+                             String rvoDefault, Set<String> eligible, String eligibleFile, LocalDateTime winStart, LocalDateTime winEnd) throws Exception {
         List<Sheet> sheets = new ArrayList<>();
+        Map<String, Meta> metaByKey = new HashMap<>();
+        for (Meta m : metas) metaByKey.put(m.issue, m);
 
-        // Summary: person x month
+        // Summary: person x month, split into COUNTED (eligible) and NOT COUNTED so the totals reconcile
         TreeSet<String> months = new TreeSet<>(), people = new TreeSet<>();
         Map<String, Double> grid = new HashMap<>();
         for (Detail d : detail) { months.add(d.month); people.add(d.person); grid.merge(d.person + "\u0001" + d.month, d.hours, Double::sum); }
         Sheet sum = new Sheet("Summary");
-        List<Object> head = new ArrayList<>(); head.add("Person"); head.addAll(months); head.add("Total");
+        List<Object> head = new ArrayList<>(); head.add("Person"); head.add("Eligible"); head.addAll(months); head.add("Total");
         sum.header(head.toArray());
-        for (String p : people) {
-            List<Object> r = new ArrayList<>(); r.add(p); double tot = 0;
-            for (String mo : months) { double v = grid.getOrDefault(p + "\u0001" + mo, 0.0); r.add(v == 0 ? null : round(v, 1)); tot += v; }
-            r.add(round(tot, 1)); sum.row(r.toArray());
+        double[] totals = new double[2];
+        for (int block = 0; block < 2; block++) {
+            boolean counted = block == 0;
+            sum.row(counted ? (eligible == null ? "COUNTED - no eligibility list configured, every named assignee (pass --eligible <file>)" : "COUNTED - on the eligibility list")
+                            : "NOT COUNTED - not on the list, or unassigned");
+            for (String p : people) {
+                if (isEligible(eligible, p) != counted) continue;
+                List<Object> r = new ArrayList<>(); r.add(p); r.add(eligLabel(eligible, p)); double tot = 0;
+                for (String mo : months) { double v = grid.getOrDefault(p + "\u0001" + mo, 0.0); r.add(v == 0 ? null : round(v, 1)); tot += v; }
+                r.add(round(tot, 1)); sum.row(r.toArray()); totals[block] += tot;
+            }
+            List<Object> tr = new ArrayList<>(); tr.add(counted ? "TOTAL counted" : "TOTAL not counted"); tr.add("");
+            for (String mo : months) { double c = 0; for (String p : people) if (isEligible(eligible, p) == counted) c += grid.getOrDefault(p + "\u0001" + mo, 0.0); tr.add(round(c, 1)); }
+            tr.add(round(totals[block], 1)); sum.header(tr.toArray());
+            sum.row();
         }
-        List<Object> tr = new ArrayList<>(); tr.add("TOTAL"); double gt = 0;
-        for (String mo : months) { double c = 0; for (String p : people) c += grid.getOrDefault(p + "\u0001" + mo, 0.0); tr.add(round(c, 1)); gt += c; }
-        tr.add(round(gt, 1)); sum.header(tr.toArray());
+        List<Object> all = new ArrayList<>(); all.add("TOTAL all assignees"); all.add("");
+        for (String mo : months) { double c = 0; for (String p : people) c += grid.getOrDefault(p + "\u0001" + mo, 0.0); all.add(round(c, 1)); }
+        all.add(round(totals[0] + totals[1], 1)); sum.header(all.toArray());
         sheets.add(sum);
+
+        // Daily: the per-person / per-project / per-day record (working days only)
+        Sheet dy = new Sheet("Daily");
+        dy.header("Date", "Weekday", "Person", "Eligible", "RVO project", "Issue", "Summary", "Phase", "Hours", "Method", "Flag");
+        daily.sort(Comparator.comparing((Daily d) -> d.date).thenComparing(d -> d.person).thenComparing(d -> d.issue).thenComparing(d -> d.phase));
+        Map<String, Double> perPersonDay = new HashMap<>();
+        for (Daily d : daily) perPersonDay.merge(d.person + "\u0001" + d.date, d.hours, Double::sum);
+        for (Daily d : daily) {
+            if (d.hours <= 0) continue;
+            double dayTot = perPersonDay.get(d.person + "\u0001" + d.date);
+            Meta mm = metaByKey.get(d.issue);
+            dy.row(d.date.toString(), d.date.getDayOfWeek().toString().substring(0, 3), d.person, eligLabel(eligible, d.person), d.rvo, d.issue,
+                   mm == null ? "" : nz(mm.summary), d.phase, round(d.hours, 3), d.method,
+                   dayTot > 8.0 ? "> 8 h on this day (" + round(dayTot, 1) + " h in total)" : "");
+        }
+        sheets.add(dy);
+
+        // DayTotals: person x day of the month (the classic hours sheet)
+        Sheet dt = new Sheet("DayTotals");
+        LocalDate first = winStart.toLocalDate(), last = winEnd.toLocalDate().minusDays(1);
+        List<Object> dh = new ArrayList<>(); dh.add("Person"); dh.add("Eligible"); dh.add("RVO project");
+        for (LocalDate d = first; !d.isAfter(last); d = d.plusDays(1)) dh.add(d.getDayOfMonth());
+        dh.add("Total"); dt.header(dh.toArray());
+        TreeMap<String, Map<LocalDate, Double>> pd = new TreeMap<>();
+        Map<String, Set<String>> rvoByPerson = new HashMap<>();
+        for (Daily d : daily) {
+            pd.computeIfAbsent(d.person, k -> new HashMap<>()).merge(d.date, d.hours, Double::sum);
+            rvoByPerson.computeIfAbsent(d.person, k -> new TreeSet<>()).add(d.rvo);
+        }
+        for (Map.Entry<String, Map<LocalDate, Double>> e : pd.entrySet()) {
+            List<Object> r = new ArrayList<>(); r.add(e.getKey()); r.add(eligLabel(eligible, e.getKey())); r.add(String.join(", ", rvoByPerson.get(e.getKey()))); double tot = 0;
+            for (LocalDate d = first; !d.isAfter(last); d = d.plusDays(1)) { double v = e.getValue().getOrDefault(d, 0.0); r.add(v == 0 ? null : round(v, 2)); tot += v; }
+            r.add(round(tot, 1)); dt.row(r.toArray());
+        }
+        sheets.add(dt);
+
+        // Evidence: every status/assignee change inside the month, with author and link (the progress trail)
+        Sheet ev = new Sheet("Evidence");
+        ev.header("Issue", "Summary", "RVO project", "Timestamp", "Author", "Field", "From", "To", "Link");
+        List<Change> inMonth = new ArrayList<>();
+        for (List<Change> cl : logs.values()) for (Change c : cl) if (c.ts != null && !c.ts.isBefore(winStart) && c.ts.isBefore(winEnd)) inMonth.add(c);
+        inMonth.sort(Comparator.comparing((Change c) -> c.key).thenComparing(c -> c.ts));
+        for (Change c : inMonth) {
+            Meta mm = metaByKey.get(c.key);
+            ev.row(c.key, mm == null ? "" : nz(mm.summary), mm == null ? rvoDefault : mm.rvo, c.ts.toString().replace('T', ' '), nz(c.author),
+                   c.field, nz(c.fromStr), nz(c.toStr), base + "/browse/" + c.key);
+        }
+        sheets.add(ev);
 
         // Detail
         Sheet det = new Sheet("Detail");
-        det.header("Issue", "Person", "Month", "Phase", "Hours", "Time held (h)", "Method");
+        det.header("Issue", "Person", "Eligible", "RVO project", "Month", "Phase", "Hours", "Time held (h, working days)", "Method");
         detail.sort(Comparator.comparing((Detail d) -> d.issue).thenComparing(d -> d.month).thenComparing(d -> d.person).thenComparing(d -> d.phase));
-        for (Detail d : detail) det.row(d.issue, d.person, d.month, d.phase, round(d.hours, 3), round(d.timeHeld, 2), d.method);
+        for (Detail d : detail) det.row(d.issue, d.person, eligLabel(eligible, d.person), d.rvo, d.month, d.phase, round(d.hours, 3), round(d.timeHeld, 2), d.method);
         sheets.add(det);
 
         // Issues
         Sheet iss = new Sheet("Issues");
-        iss.header("Issue", "Type", "Current status", "DEV SP", "QA SP", "Total SP", "DEV budget (h)", "QA budget (h)", "DEV allocated", "QA allocated", "Method", "Note");
+        iss.header("Issue", "Summary", "RVO project", "Type", "Current status", "DEV SP", "QA SP", "Total SP", "DEV budget (h)", "QA budget (h)", "DEV allocated", "QA allocated", "Method", "Note", "Link");
         metas.sort(Comparator.comparing(x -> x.issue));
-        for (Meta m : metas) iss.row(m.issue, m.issueType, m.status, m.devSp, m.qaSp, m.totalSp, m.devBudget, m.qaBudget, m.devAlloc, m.qaAlloc, m.method, m.note);
+        for (Meta m : metas) iss.row(m.issue, nz(m.summary), m.rvo, m.issueType, m.status, m.devSp, m.qaSp, m.totalSp, m.devBudget, m.qaBudget, m.devAlloc, m.qaAlloc, m.method, m.note, base + "/browse/" + m.issue);
         sheets.add(iss);
 
         // StatusAudit
@@ -480,16 +647,22 @@ public class WbsoHours {
         no.header("WBSO hours substantiation — methodology", "");
         no.row("Generated", LocalDateTime.now().toString());
         no.row("Project", project); no.row("Label", label); no.row("Reporting month", targetMonth);
+        no.row("RVO project", "Default " + rvoDefault + " (--rvo-project). An issue label 'wbso-<id>' overrides it per issue. Daily, DayTotals, Detail, Issues and Evidence carry the number.");
+        no.row("Eligibility", eligible == null
+                ? "NO list configured: every named assignee is counted. Before anything goes to SubVice, pass --eligible <file> with one Jira display name per line (Validaide B.V. payroll only)."
+                : "List " + eligibleFile + " (" + eligible.size() + " names). Only listed people are counted; others and unassigned time sit in the NOT COUNTED block of Summary so totals still reconcile.");
         no.row("Hours per story point", HOURS_PER_POINT);
         no.row("Base of truth", "Story Points DEV + QA (separate). Total used only when both are empty.");
-        no.row("Per-person split", "Role-based, time-weighted: DEV hours to DEV-phase holders, QA to QA-phase holders, proportional to time held.");
+        no.row("Per-person split", "Role-based, time-weighted: DEV hours to DEV-phase holders, QA to QA-phase holders, proportional to time held on working days (Mon-Fri). Weekend time is ignored in numerator and denominator.");
+        no.row("Per-day split", "Each person's hours on an issue are spread over the working days the ticket was held in that phase, proportional to the time held per day. Daily rows sum to the Detail rows; DayTotals is Daily pivoted per person and day.");
         no.row("Month attribution", "Each month gets the share of the issue's point-budget equal to the phase-time inside that month divided by the issue's whole-life phase-time. Months are mutually consistent and sum to the issue total.");
         no.row("DEV-phase statuses", String.join(", ", new TreeSet<>(DEV_STATUSES)));
         no.row("QA-phase statuses", String.join(", ", new TreeSet<>(QA_STATUSES)));
-        no.row("Nature of figures", "Derived ESTIMATE: story points x 4, allocated by recorded status history. Not a log of actual hours. Every Summary figure traces through Detail to an issue/person/month/phase.");
-        no.row("Fallback rows", "Issues with story points but NO DEV/QA-phase changelog timeline are attributed to the current assignee, in the single month they were last updated/resolved (flagged in Issues), so they land once across monthly runs. Pre-refinement tickets get zero.");
-        no.row("Unassigned", "Work-phase time while unassigned is bucketed as '(unassigned)' so totals reconcile.");
-        no.row("Dutch-employee filter", "NOT applied; all assignees included. Filter downstream.");
+        no.row("Nature of figures", "Derived ESTIMATE: story points x 4, allocated by recorded status history. Not a log of actual hours. Every Summary figure traces through Detail and Daily to an issue/person/project/day/phase.");
+        no.row("Evidence tab", "Every status and assignee change inside the month, with timestamp, author and a link to the issue: the progress trail behind the hours.");
+        no.row("Daily flag", "A person with more than 8 h on one day is flagged in Daily. It usually means a large ticket was held briefly; review before filing.");
+        no.row("Fallback rows", "Issues with story points but NO DEV/QA-phase changelog timeline are attributed to the current assignee, on the day they were last updated/resolved (flagged in Issues), so they land once across monthly runs. Pre-refinement tickets get zero.");
+        no.row("Unassigned", "Work-phase time while unassigned is bucketed as '(unassigned)' and never counted, so totals reconcile and the gap is visible.");
         sheets.add(no);
 
         zipXlsx(out, sheets);
@@ -593,7 +766,7 @@ public class WbsoHours {
         Map<String, List<Change>> logs = new LinkedHashMap<>();
 
         // VALCM-1: 10 DEV SP, 5 QA SP. Dev by Alice (Jan), reassigned to Bob for review (Feb), QA by Carol (Feb).
-        Issue a = new Issue(); a.key = "VALCM-1"; a.issueType = "Story"; a.devSp = 10.0; a.qaSp = 5.0;
+        Issue a = new Issue(); a.key = "VALCM-1"; a.summary = "Bulk lane upload"; a.issueType = "Story"; a.devSp = 10.0; a.qaSp = 5.0; a.labels.add("wbso");
         a.created = "2026-01-05T09:00:00.000+0000"; a.currentStatus = "Done"; a.currentAssignee = "Carol";
         a.resolved = "2026-02-20T17:00:00.000+0000"; a.updated = "2026-02-20T17:00:00.000+0000";
         issues.add(a);
@@ -608,7 +781,7 @@ public class WbsoHours {
         ));
 
         // VALCM-2: only total SP = 4 (fallback). Dev by Dan entirely in Jan.
-        Issue b = new Issue(); b.key = "VALCM-2"; b.issueType = "Task"; b.totalSp = 4.0;
+        Issue b = new Issue(); b.key = "VALCM-2"; b.summary = "Weather cache expiry"; b.issueType = "Task"; b.totalSp = 4.0; b.labels.add("wbso"); b.labels.add("wbso-2602");
         b.created = "2026-01-15T09:00:00.000+0000"; b.currentStatus = "Done"; b.currentAssignee = "Dan";
         b.resolved = "2026-01-25T12:00:00.000+0000"; b.updated = "2026-01-25T12:00:00.000+0000";
         issues.add(b);
@@ -619,7 +792,7 @@ public class WbsoHours {
         ));
 
         // VALCM-3: work happened entirely in 2025 (before clip) -> should contribute 0.
-        Issue c = new Issue(); c.key = "VALCM-3"; c.issueType = "Story"; c.devSp = 8.0;
+        Issue c = new Issue(); c.key = "VALCM-3"; c.summary = "Old work from 2025"; c.issueType = "Story"; c.devSp = 8.0; c.labels.add("wbso");
         c.created = "2025-11-01T09:00:00.000+0000"; c.currentStatus = "Done"; c.currentAssignee = "Eve";
         c.resolved = "2025-12-15T09:00:00.000+0000"; c.updated = "2025-12-15T09:00:00.000+0000";
         issues.add(c);
@@ -632,6 +805,6 @@ public class WbsoHours {
         return new Object[]{issues, logs};
     }
     static Change ch(String key, String ts, String field, String from, String to) {
-        Change c = new Change(); c.key = key; c.ts = parseTs(ts); c.field = field; c.fromStr = from; c.toStr = to; return c;
+        Change c = new Change(); c.key = key; c.ts = parseTs(ts); c.field = field; c.fromStr = from; c.toStr = to; c.author = "synthetic"; return c;
     }
 }
